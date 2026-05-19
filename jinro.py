@@ -1437,6 +1437,9 @@ class Game:
         self.recruiting_message = None
         self.wolf_vote_view = None     # WolfVoteView en cours (None si entre les nuits)
 
+        # Task asyncio (pour pouvoir cancel proprement via !abort)
+        self.task = None
+
         # Timing
         self.started_at = datetime.now(PARIS_TZ)
         self.ended_at = None
@@ -1497,6 +1500,7 @@ class GameManager:
             ))
 
         game = Game(ctx, size_mode, player_count)
+        game.task = asyncio.current_task()  # référence pour pouvoir cancel depuis !abort
         active_games[ctx.channel.id] = game
         try:
             await GameManager.run_recruiting(game)
@@ -1507,6 +1511,10 @@ class GameManager:
             await GameManager.run_captain_election(game)
             await GameManager.run_game_loop(game)
             await GameManager.run_resolution(game)
+        except asyncio.CancelledError:
+            log.info(f"Partie {game.game_id} annulée (task cancelled).")
+            # On laisse le finally faire le cleanup. Pas de message d'erreur :
+            # !abort a déjà envoyé sa confirmation.
         except Exception as e:
             log.error(f"Erreur partie {game.game_id}: {e}\n{traceback.format_exc()}")
             try:
@@ -1517,9 +1525,12 @@ class GameManager:
             except discord.HTTPException:
                 pass
         finally:
-            # Cleanup garanti : restore pseudos, unmute, supprime le salon loups
+            # Cleanup garanti — protégé d'une éventuelle nouvelle annulation
             try:
-                await GameManager.cleanup_game_state(game)
+                await asyncio.shield(GameManager.cleanup_game_state(game))
+            except asyncio.CancelledError:
+                # On a été re-cancel pendant le cleanup, tant pis (le cleanup a fait ce qu'il a pu)
+                pass
             except Exception as e:
                 log.error(f"cleanup_game_state: {e}")
             active_games.pop(ctx.channel.id, None)
@@ -3292,15 +3303,21 @@ async def _lg(ctx):
 
 @bot.command(name="abort")
 async def _abort(ctx):
-    """Annule une partie en cours (MJ+)."""
+    """Annule une partie en cours (MJ+). Stoppe immédiatement la coroutine."""
     if not has_min_rank(ctx.author.id, 2):
         return await ctx.send(embed=error_embed("❌ Permission refusée", "**MJ+** requis."))
     game = active_games.get(ctx.channel.id)
     if not game:
         return await ctx.send(embed=error_embed("❌ Aucune partie", "Aucune partie n'est active."))
     game.phase = "ENDED"
-    active_games.pop(ctx.channel.id, None)
-    await ctx.send(embed=success_embed("✅ Partie annulée", "La partie a été annulée par un MJ."))
+    await ctx.send(embed=success_embed(
+        "✅ Partie annulée",
+        "La partie a été annulée par un MJ. Nettoyage en cours..."
+    ))
+    # Annule la coroutine d'orchestration → arrête immédiatement les embeds suivants.
+    # Le cleanup (pseudos, mute, salon loups) se fait dans le finally de start_game.
+    if game.task and not game.task.done() and game.task != asyncio.current_task():
+        game.task.cancel()
 
 
 @bot.command(name="roles")

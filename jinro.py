@@ -37,11 +37,17 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "jinro.db")
 
 # Timings (en secondes) — modifiables ici
-RECRUIT_TIMEOUT = 600       # 10 min
-NIGHT_DURATION = 75         # phase de nuit (DM)
-CAPTAIN_VOTE_DURATION = 45  # élection du capitaine (jour 1)
-DEBATE_DURATION = 90        # débat de jour
-VOTE_DURATION = 45          # vote du village
+# Timings par défaut (modifiables via !settime, persistants en DB)
+DEFAULT_TIMINGS = {
+    "recruit":      600,   # recrutement
+    "night":         60,   # actions de nuit (voyante, salvateur, petite fille, cupidon, loups en parallèle)
+    "witch":         25,   # phase sorcière (après les loups)
+    "debate":        90,   # débat de jour
+    "vote_day":      45,   # vote du village
+    "captain_vote":  45,   # élection capitaine (jour 1)
+    "hunter":        30,   # tir du chasseur à sa mort
+    "successor":     30,   # capitaine désigne successeur
+}
 MAX_NIGHTS = 20             # garde-fou anti-boucle infinie
 
 MIN_PLAYERS = 6
@@ -160,6 +166,36 @@ def get_prefix_cached():
     if _prefix_cache["value"] is None:
         _prefix_cache["value"] = get_config("prefix") or DEFAULT_PREFIX
     return _prefix_cache["value"]
+
+
+# ---- Timings (dynamiques, persistants) ----
+
+def get_timing(key):
+    """Retourne la durée en secondes pour une phase donnée."""
+    if key not in DEFAULT_TIMINGS:
+        return 60
+    val = get_config(f"timing_{key}")
+    if val is None:
+        return DEFAULT_TIMINGS[key]
+    try:
+        return max(5, min(3600, int(val)))
+    except ValueError:
+        return DEFAULT_TIMINGS[key]
+
+
+def set_timing(key, value):
+    if key not in DEFAULT_TIMINGS:
+        raise ValueError(f"Phase inconnue : {key}")
+    set_config(f"timing_{key}", int(value))
+
+
+def reset_timing(key):
+    if key not in DEFAULT_TIMINGS:
+        raise ValueError(f"Phase inconnue : {key}")
+    conn = get_db()
+    conn.execute("DELETE FROM config WHERE key = ?", (f"timing_{key}",))
+    conn.commit()
+    conn.close()
 
 
 # ---- Rangs ----
@@ -594,6 +630,254 @@ async def check_ban(ctx):
         await ctx.send(embed=em)
         return True
     return False
+
+
+# ========================= INDICES VOYANTE =========================
+# Descriptions narratives par camp. 70% chance d'indice correct, 30% trompeur.
+
+SEER_HINTS = {
+    "wolf": [
+        "Tu sens une **aura prédatrice** et l'odeur ferreuse du sang.",
+        "Ses yeux semblent briller dans la nuit comme ceux d'une bête affamée.",
+        "Une **fureur ancienne** sommeille en cette personne.",
+        "Tu perçois un grondement sourd, presque animal, sous sa peau.",
+        "Son ombre te paraît plus longue que les autres.",
+        "L'aura qui l'entoure est **sombre, lourde, dangereuse**.",
+        "Quelque chose en elle te fait frissonner — un appel sauvage.",
+        "Tu vois des **crocs** dans son sourire fantôme.",
+    ],
+    "village": [
+        "Une **aura paisible** émane d'elle.",
+        "Tu sens un cœur simple et droit, sans malice.",
+        "Aucune ombre ne te trouble dans son âme.",
+        "Sa lumière est faible mais **pure**.",
+        "Tu ressens la **tiédeur d'un foyer** près d'elle.",
+        "Rien dans son aura ne trahit la bête.",
+        "Tu perçois la **fatigue honnête** d'un travailleur.",
+        "Son souffle est calme, son esprit serein.",
+    ],
+    "solo": [  # Tenshi
+        "Une **présence céleste**, ni loup ni mortel ordinaire.",
+        "Tu ressens une mélancolie surnaturelle, presque divine.",
+        "Quelque chose en elle **n'appartient pas à ce monde**.",
+        "Une plume invisible te frôle quand tu la regardes.",
+    ],
+}
+
+
+def get_seer_hint(true_camp: str):
+    """Retourne un indice narratif. 70% juste, 30% trompeur (sans le dire)."""
+    rng = random.random()
+    if rng < 0.30:
+        # Trompeur : indice du camp opposé (loups/village uniquement, Tenshi reste solo si pris)
+        if true_camp == "wolf":
+            fake = "village"
+        elif true_camp == "village":
+            fake = "wolf"
+        else:  # solo → balancé entre wolf et village
+            fake = random.choice(["wolf", "village"])
+        return random.choice(SEER_HINTS[fake])
+    return random.choice(SEER_HINTS[true_camp])
+
+
+# ========================= NARRATION DE NUIT =========================
+# Messages d'ambiance envoyés dans le salon principal pendant la nuit.
+
+NIGHT_NARRATIONS = {
+    "fall":      ("🌑", "**La nuit tombe sur Shoen.** Les villageois s'enferment chez eux, le souffle court..."),
+    "miko":      ("🔮", "**La Miko ouvre ses yeux d'aigle.** Elle scrute les âmes, cherchant la noirceur..."),
+    "mamori":    ("🛡️", "**Le Mamori veille en silence.** Sa lanterne brûle au-dessus d'un foyer endormi..."),
+    "enmusubi":  ("💞", "**L'Enmusubi tisse le fil rouge.** Deux destins se trouvent à jamais liés..."),
+    "shojo":     ("👧", "**Une petite porte s'entrouvre dans la pénombre.** Des yeux d'enfant épient les ombres..."),
+    "okami":     ("🐺", "**Les Ōkami se rassemblent dans la forêt.** Leurs grognements emplissent la nuit..."),
+    "okami_pick": ("🩸", "**La meute a choisi sa proie.** Des griffes raclent une porte de bois..."),
+    "majo":      ("🧪", "**La Majo se réveille à son tour.** Elle tend la main vers ses fioles de verre..."),
+    "dawn":      ("🌅", "**L'aube se lève sur Shoen.** Le village ose enfin ouvrir les yeux..."),
+}
+
+
+async def narrate(channel, key: str):
+    emoji, text = NIGHT_NARRATIONS.get(key, ("", ""))
+    if not text:
+        return
+    em = discord.Embed(description=f"{emoji}  *{text}*", color=0x1f2733)
+    em.set_footer(text=FOOTER_TEXT)
+    try:
+        await channel.send(embed=em)
+    except discord.HTTPException as e:
+        log.warning(f"narrate({key}): {e}")
+
+
+# ========================= PSEUDOS DES MORTS =========================
+
+async def mark_dead_nickname(member: discord.Member):
+    """Renomme le membre avec '(MORT)' (ou juste 'MORT' si trop long).
+    Retourne le nick original (None si pas de nick custom) ou False si échec."""
+    if member.guild.me.top_role <= member.top_role and member.id != member.guild.owner_id:
+        # Le bot ne peut pas modifier ce membre (rôle supérieur ou owner)
+        pass  # tentera quand même
+    original_nick = member.nick  # None si pas de nick custom
+    base_name = original_nick or member.display_name
+    new_nick = f"{base_name} (MORT)"
+    if len(new_nick) > 32:
+        new_nick = "MORT"
+    try:
+        await member.edit(nick=new_nick, reason="Jinrō : joueur mort")
+        return original_nick
+    except discord.Forbidden:
+        log.info(f"Pas de perm pour renommer {member} (rôle trop bas ou owner)")
+        return False
+    except discord.HTTPException as e:
+        log.warning(f"Échec rename {member}: {e}")
+        return False
+
+
+async def restore_nickname(member: discord.Member, original_nick):
+    """Restaure le nick d'origine. original_nick peut être None (= pas de nick custom)."""
+    if original_nick is False:
+        return  # on n'a jamais pu le renommer
+    try:
+        await member.edit(nick=original_nick, reason="Jinrō : fin de partie")
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.warning(f"Échec restore nick {member}: {e}")
+
+
+# ========================= MUTE DES MORTS =========================
+
+async def mute_dead_player(game, member: discord.Member):
+    """Permission override sur les salons autorisés + salon de partie + salon loups + mute vocal."""
+    guild = game.guild
+    allowed_ids = get_allowed_channels(guild.id)
+    # Toujours muter au moins dans le salon de la partie
+    target_channels = set(allowed_ids)
+    target_channels.add(str(game.channel.id))
+    # Et dans le salon des loups si on y a accès (un loup mort ne doit plus pouvoir y poster)
+    if game.wolf_channel:
+        target_channels.add(str(game.wolf_channel.id))
+
+    for cid in target_channels:
+        ch = guild.get_channel(int(cid))
+        if not ch:
+            continue
+        try:
+            await ch.set_permissions(
+                member,
+                send_messages=False,
+                add_reactions=False,
+                send_messages_in_threads=False,
+                reason="Jinrō : joueur mort",
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"mute texte échec {member} dans {ch}: {e}")
+
+    # Mute vocal serveur si en vocal
+    if member.voice and member.voice.channel:
+        try:
+            await member.edit(mute=True, reason="Jinrō : joueur mort")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"mute vocal échec {member}: {e}")
+
+
+async def unmute_player(game, member: discord.Member):
+    """Retire les override sur les salons et démute en vocal."""
+    guild = game.guild
+    allowed_ids = get_allowed_channels(guild.id)
+    target_channels = set(allowed_ids)
+    target_channels.add(str(game.channel.id))
+    if game.wolf_channel:
+        target_channels.add(str(game.wolf_channel.id))
+
+    for cid in target_channels:
+        ch = guild.get_channel(int(cid))
+        if not ch:
+            continue
+        try:
+            await ch.set_permissions(member, overwrite=None, reason="Jinrō : fin de partie")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"unmute texte échec {member} dans {ch}: {e}")
+
+    if member.voice and member.voice.channel:
+        try:
+            await member.edit(mute=False, reason="Jinrō : fin de partie")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"unmute vocal échec {member}: {e}")
+
+
+# ========================= SALON PRIVÉ LOUPS =========================
+
+async def create_wolf_channel(game):
+    """Crée un salon texte privé pour les loups dans la même catégorie que la partie."""
+    guild = game.guild
+    wolves = game.alive_wolves()
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, manage_channels=True, embed_links=True
+        ),
+    }
+    for w in wolves:
+        overwrites[w] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True, add_reactions=True
+        )
+    try:
+        channel = await guild.create_text_channel(
+            name=f"🐺-meute-{game.game_id[-6:]}",
+            overwrites=overwrites,
+            category=game.channel.category,
+            topic="Salon privé de la meute — discussion et vote",
+            reason=f"Jinrō : meute partie {game.game_id}",
+        )
+        game.wolf_channel = channel
+        intro = discord.Embed(
+            title="🐺 Bienvenue dans la tanière",
+            description=(
+                "Vous êtes les **Ōkami** de cette partie.\n"
+                "Discutez librement ici — les villageois ne voient rien.\n\n"
+                "Chaque nuit, un message de vote apparaîtra. **C'est la majorité qui désigne la victime.**"
+            ),
+            color=0xe74c3c,
+        ).set_footer(text=FOOTER_TEXT)
+        await channel.send(content=" ".join(w.mention for w in wolves), embed=intro)
+        return channel
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.error(f"Création salon loups échec: {e}")
+        try:
+            await game.channel.send(embed=error_embed(
+                "⚠️ Impossible de créer le salon des loups",
+                "Le bot manque de la permission **Gérer les salons**. Les loups voteront en DM."
+            ))
+        except discord.HTTPException:
+            pass
+        return None
+
+
+async def add_to_wolf_channel(game, member: discord.Member):
+    """Ajoute un joueur infecté au salon des loups."""
+    if not game.wolf_channel:
+        return
+    try:
+        await game.wolf_channel.set_permissions(
+            member,
+            view_channel=True, send_messages=True, read_message_history=True, add_reactions=True,
+            reason="Jinrō : infection",
+        )
+        await game.wolf_channel.send(embed=discord.Embed(
+            title="🩸 Un nouveau loup rejoint la meute",
+            description=f"{member.mention} a été infecté(e) cette nuit.",
+            color=0xe74c3c,
+        ).set_footer(text=FOOTER_TEXT))
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.warning(f"add_to_wolf_channel: {e}")
+
+
+async def delete_wolf_channel(game):
+    if not game.wolf_channel:
+        return
+    try:
+        await game.wolf_channel.delete(reason="Jinrō : fin de partie")
+    except (discord.Forbidden, discord.HTTPException, discord.NotFound) as e:
+        log.warning(f"Suppression salon loups : {e}")
+    game.wolf_channel = None
 
 
 # ========================= XP / CLASSES =========================
@@ -1138,6 +1422,12 @@ class Game:
         # Actions de la nuit courante
         self.night_actions = {}        # user_id → {"action": ..., "target": ..., "data": ...}
         self.wolf_votes = {}           # wolf_id → target_id (vote des loups)
+        self.current_wolf_target = None  # victime déterminée après vote des loups (pour la sorcière)
+
+        # Modifs serveur à restaurer en fin de partie
+        self.original_nicks = {}       # user_id → original_nick (None ou str ou False)
+        self.muted_players = set()     # user_ids qui ont été mutés
+        self.wolf_channel = None       # discord.TextChannel | None
 
         # Résolution
         self.winning_camp = None       # "wolf" / "village" / "lovers" / "tenshi"
@@ -1145,6 +1435,7 @@ class Game:
 
         # Messages
         self.recruiting_message = None
+        self.wolf_vote_view = None     # WolfVoteView en cours (None si entre les nuits)
 
         # Timing
         self.started_at = datetime.now(PARIS_TZ)
@@ -1212,6 +1503,7 @@ class GameManager:
             if game.phase == "ENDED":
                 return
             await GameManager.run_roles_assignment(game)
+            await create_wolf_channel(game)
             await GameManager.run_captain_election(game)
             await GameManager.run_game_loop(game)
             await GameManager.run_resolution(game)
@@ -1225,14 +1517,35 @@ class GameManager:
             except discord.HTTPException:
                 pass
         finally:
+            # Cleanup garanti : restore pseudos, unmute, supprime le salon loups
+            try:
+                await GameManager.cleanup_game_state(game)
+            except Exception as e:
+                log.error(f"cleanup_game_state: {e}")
             active_games.pop(ctx.channel.id, None)
+
+    @staticmethod
+    async def cleanup_game_state(game):
+        """Restaure tout ce qui a été modifié sur le serveur."""
+        # Pseudos
+        for uid, original in list(game.original_nicks.items()):
+            member = game.guild.get_member(uid)
+            if member:
+                await restore_nickname(member, original)
+        # Mutes
+        for uid in list(game.muted_players):
+            member = game.guild.get_member(uid)
+            if member:
+                await unmute_player(game, member)
+        # Salon loups
+        await delete_wolf_channel(game)
 
     # ─────────────────── PHASE 1 : RECRUTEMENT ────────────────────
 
     @staticmethod
     async def run_recruiting(game: Game):
         game.phase = "RECRUITING"
-        view = RecruitingView(game, timeout=RECRUIT_TIMEOUT)
+        view = RecruitingView(game, timeout=get_timing("recruit"))
         em = GameManager.build_recruiting_embed(game)
         msg = await game.channel.send(embed=em, view=view)
         game.recruiting_message = msg
@@ -1372,18 +1685,19 @@ class GameManager:
 
     @staticmethod
     async def run_captain_election(game: Game):
+        captain_dur = get_timing("captain_vote")
         em = discord.Embed(
             title="👑 Élection du Sonchō",
             description=(
                 f"Avant que la nuit ne tombe, le village doit choisir son **Sonchō (Capitaine)**.\n\n"
                 f"Le Sonchō a un **vote qui compte double** et tranche en cas d'égalité.\n"
                 f"S'il meurt, il désigne son successeur.\n\n"
-                f"⏳ **{CAPTAIN_VOTE_DURATION} secondes** pour voter."
+                f"⏳ **{captain_dur} secondes** pour voter."
             ),
             color=0xf1c40f,
         )
         em.set_footer(text=FOOTER_TEXT)
-        view = CaptainVoteView(game, timeout=CAPTAIN_VOTE_DURATION)
+        view = CaptainVoteView(game, timeout=captain_dur)
         msg = await game.channel.send(embed=em, view=view)
         view.message = msg
         await view.wait()
@@ -1435,26 +1749,38 @@ class GameManager:
         # Garde-fou
         log.warning(f"Partie {game.game_id} a atteint MAX_NIGHTS={MAX_NIGHTS}")
 
-    # ─────────────────── PHASE NUIT ────────────────────
+    # ─────────────────── PHASE NUIT (séquencée + narration) ────────────────────
 
     @staticmethod
     async def run_night(game: Game):
-        """Phase de nuit : DM à tous les joueurs avec pouvoir actif."""
+        """Phase de nuit : séquencement narratif.
+        Bloc 1 (en parallèle, ~night sec) : Voyante, Salvateur, Petite Fille, Cupidon (nuit 1), Loups (salon dédié)
+        Annonce intermédiaire + cible des loups
+        Bloc 2 (~witch sec) : Sorcière avec info de la victime
+        Résolution finale + aube
+        """
         game.night_actions = {}
         game.wolf_votes = {}
+        game.current_wolf_target = None
+        night_dur = get_timing("night")
+        witch_dur = get_timing("witch")
 
+        # === Annonce de la nuit ===
         em = discord.Embed(
-            title=f"🌙 Nuit {game.night_number}",
+            title=f"🌑 Nuit {game.night_number}",
             description=(
                 "Le village s'endort. Les loups et les esprits s'éveillent...\n\n"
-                f"⏳ **{NIGHT_DURATION} secondes** avant l'aube."
+                f"⏳ La nuit dure environ **{night_dur + witch_dur} secondes**."
             ),
             color=0x1f2733,
         )
         em.set_footer(text=FOOTER_TEXT)
         await game.channel.send(embed=em)
+        await asyncio.sleep(2)
+        await narrate(game.channel, "fall")
 
-        # Construit les DM d'action
+        # === Lance les actions de nuit en parallèle (DM + salon loups) ===
+        active_roles = set()
         dm_tasks = []
         for m in game.alive_players():
             rkey = game.roles_assignment[m.id]
@@ -1462,127 +1788,281 @@ class GameManager:
             when = role.get("action_when")
 
             if when == "night1" and game.night_number == 1:
-                dm_tasks.append(GameManager.send_night_action_dm(game, m, rkey))
+                active_roles.add(rkey)
+                if rkey == "enmusubi":
+                    dm_tasks.append(GameManager.send_night_action_dm(game, m, rkey, night_dur))
             elif when == "night":
-                dm_tasks.append(GameManager.send_night_action_dm(game, m, rkey))
+                # Les loups votent dans leur salon, pas en DM
+                if rkey in ("okami", "oyaokami"):
+                    active_roles.add(rkey)
+                elif rkey == "majo":
+                    active_roles.add(rkey)  # joue dans bloc 2
+                else:
+                    active_roles.add(rkey)
+                    dm_tasks.append(GameManager.send_night_action_dm(game, m, rkey, night_dur))
 
         await asyncio.gather(*dm_tasks, return_exceptions=True)
 
-        # Attente
-        await asyncio.sleep(NIGHT_DURATION)
+        # Lance le vote des loups dans leur salon (parallèle au bloc 1)
+        wolf_vote_task = None
+        if any(r in active_roles for r in ("okami", "oyaokami")):
+            wolf_vote_task = asyncio.create_task(GameManager.run_wolf_phase(game, night_dur))
 
-        # Résolution
+        # === Narration échelonnée pendant le bloc 1 ===
+        narration_task = asyncio.create_task(
+            GameManager.narrate_night_block1(game, night_dur, active_roles)
+        )
+
+        # Attendre la durée du bloc 1
+        await asyncio.sleep(night_dur)
+
+        # Fin de phase : on attend la narration et on stoppe le vote loups
+        try:
+            await asyncio.wait_for(narration_task, timeout=3)
+        except asyncio.TimeoutError:
+            narration_task.cancel()
+
+        if wolf_vote_task:
+            if not wolf_vote_task.done():
+                wolf_vote_task.cancel()
+                try:
+                    await wolf_vote_task
+                except asyncio.CancelledError:
+                    pass
+
+        # Disable le message de vote des loups pour figer leur choix
+        if game.wolf_vote_view:
+            game.wolf_vote_view.stop()
+            try:
+                for item in game.wolf_vote_view.children:
+                    item.disabled = True
+                if game.wolf_vote_view.message:
+                    await game.wolf_vote_view.message.edit(view=game.wolf_vote_view)
+            except discord.HTTPException:
+                pass
+
+        # === Pré-calcul de la cible des loups (pour la sorcière) ===
+        game.current_wolf_target = GameManager.compute_wolf_target(game)
+
+        # === Bloc 2 : Sorcière (si vivante et pas encore résolue) ===
+        majo_alive = next(
+            (m for m in game.alive_players()
+             if game.roles_assignment[m.id] == "majo"
+             and (not game.majo_heal_used or not game.majo_poison_used)),
+            None
+        )
+        if majo_alive:
+            await narrate(game.channel, "majo")
+            await GameManager.send_witch_dm(game, majo_alive, witch_dur)
+            await asyncio.sleep(witch_dur)
+
+        # === Aube ===
+        await narrate(game.channel, "dawn")
+        await asyncio.sleep(2)
+
+        # === Résolution finale ===
         await GameManager.resolve_night(game)
 
     @staticmethod
-    async def send_night_action_dm(game: Game, member: discord.Member, role_key: str):
+    async def narrate_night_block1(game, total_duration, active_roles):
+        """Diffuse les messages d'ambiance pendant la nuit (échelonnés sur total_duration)."""
+        # On répartit les annonces sur les 80% premiers de la durée
+        events = []
+        if "miko" in active_roles:
+            events.append("miko")
+        if "mamori" in active_roles:
+            events.append("mamori")
+        if "enmusubi" in active_roles:
+            events.append("enmusubi")
+        if "shojo" in active_roles:
+            events.append("shojo")
+        if any(r in active_roles for r in ("okami", "oyaokami")):
+            events.append("okami")
+
+        if not events:
+            return
+
+        # Mélange l'ordre pour varier
+        random.shuffle(events)
+        # Premier message après 4-6s, puis espacement régulier
+        usable = max(total_duration - 8, 10)
+        step = max(usable // (len(events) + 1), 4)
+        await asyncio.sleep(min(5, total_duration // 4))
+
+        for ev in events:
+            await narrate(game.channel, ev)
+            await asyncio.sleep(step)
+
+    @staticmethod
+    async def run_wolf_phase(game, duration):
+        """Affiche le panneau de vote des loups dans leur salon dédié."""
+        if not game.wolf_channel:
+            return
+        targets = [m for m in game.alive_players() if not game.is_wolf(m.id)]
+        if not targets:
+            return
+        em = discord.Embed(
+            title=f"🐺 Vote de la meute — Nuit {game.night_number}",
+            description=(
+                "Choisissez votre victime. **La majorité l'emporte.**\n"
+                f"⏳ Vous avez environ **{duration} secondes**.\n\n"
+                f"*Loups vivants :* {', '.join(w.mention for w in game.alive_wolves())}"
+            ),
+            color=0xe74c3c,
+        ).set_footer(text=FOOTER_TEXT)
+        view = WolfVoteView(game, targets, timeout=duration)
+        msg = await game.wolf_channel.send(embed=em, view=view)
+        view.message = msg
+        game.wolf_vote_view = view
+        try:
+            await view.wait()
+        except asyncio.CancelledError:
+            view.stop()
+            raise
+
+    @staticmethod
+    def compute_wolf_target(game):
+        """Détermine la victime des loups (majorité, départage aléatoire)."""
+        if not game.wolf_votes:
+            return None
+        tally = {}
+        for tgt in game.wolf_votes.values():
+            tally[tgt] = tally.get(tgt, 0) + 1
+        max_v = max(tally.values())
+        top = [t for t, v in tally.items() if v == max_v]
+        return random.choice(top)
+
+    @staticmethod
+    async def send_night_action_dm(game: Game, member: discord.Member, role_key: str, duration: int):
+        """DM individuel pour les actions de nuit (sauf loups : salon dédié, et sorcière : bloc 2)."""
         role = ROLES[role_key]
         others_alive = [m for m in game.alive_players() if m.id != member.id]
 
-        try:
-            if role_key == "okami" or role_key == "oyaokami":
-                # Les loups ciblent un non-loup
-                targets = [m for m in game.alive_players() if not game.is_wolf(m.id)]
-                view = WolfActionView(game, member, role_key, targets)
-                content = (
-                    f"🐺 **{role['name']}** — Nuit {game.night_number}\n\n"
-                    f"Choisis ta victime. Si plusieurs loups votent, c'est la majorité qui l'emporte."
-                )
-                if role_key == "oyaokami" and not game.oyaokami_infect_used:
-                    content += "\n\n🩸 Tu peux aussi **infecter** ta cible (1x partie) au lieu de la tuer."
-
-            elif role_key == "miko":
-                view = SimpleActionView(game, member, role_key, others_alive)
-                content = f"🔮 **Miko** — Sonde un joueur pour connaître son camp."
-
-            elif role_key == "majo":
-                # Vue spéciale avec choix multiples
-                # On envoie pour l'instant juste une vue de choix d'action
-                view = MajoActionView(game, member)
-                content = (
-                    f"🧪 **Majo** — Nuit {game.night_number}\n\n"
-                    f"Tes potions restantes :\n"
-                    f"🍵 Potion de vie : {'✅ disponible' if not game.majo_heal_used else '❌ utilisée'}\n"
-                    f"☠️ Potion de mort : {'✅ disponible' if not game.majo_poison_used else '❌ utilisée'}\n\n"
-                    f"Choisis ce que tu veux faire."
-                )
-
-            elif role_key == "enmusubi":
-                view = EnmusubiActionView(game, member, game.alive_players())
-                content = (
-                    f"💞 **Enmusubi** — Première nuit\n\n"
-                    f"Choisis **deux joueurs** à lier par le fil rouge. "
-                    f"Tu peux te choisir parmi eux. Si l'un meurt, l'autre suivra."
-                )
-
-            elif role_key == "mamori":
-                # Filtre la cible interdite (dernière protection)
-                valid = list(others_alive) + [member]  # peut se protéger soi-même
-                valid = [m for m in valid if m.id in game.alive]
-                if game.last_mamori_target is not None:
-                    valid = [m for m in valid if m.id != game.last_mamori_target]
-                if not valid:
-                    return
-                view = SimpleActionView(game, member, role_key, valid)
-                content = (
-                    f"🛡️ **Mamori** — Nuit {game.night_number}\n\n"
-                    f"Protège un joueur des loups (pas la même cible 2 nuits d'affilée)."
-                )
-
-            elif role_key == "shojo":
-                view = ShojoActionView(game, member)
-                content = (
-                    f"👧 **Shōjo** — Nuit {game.night_number}\n\n"
-                    f"Tu peux entrouvrir la porte pour épier les loups.\n"
-                    f"⚠️ **35% de chance d'être repérée** — si c'est le cas, tu meurs cette nuit."
-                )
-            else:
-                return
-
+        if role_key == "miko":
+            view = SimpleActionView(game, member, role_key, others_alive, timeout=duration)
             em = discord.Embed(
-                title=f"{role['emoji']} Action de nuit",
-                description=content,
+                title="🔮 La Miko ouvre les yeux",
+                description=(
+                    f"Nuit {game.night_number}. Tu sondes l'âme d'un villageois.\n\n"
+                    f"⚠️ *Tes visions sont parfois trompées par la peur ou les ombres.*\n\n"
+                    f"Choisis ta cible."
+                ),
+                color=0x3498db,
+            )
+
+        elif role_key == "enmusubi":
+            view = EnmusubiActionView(game, member, game.alive_players(), timeout=duration)
+            em = discord.Embed(
+                title="💞 L'Enmusubi tisse le fil rouge",
+                description=(
+                    "Choisis **deux joueurs** à lier d'amour pour l'éternité.\n"
+                    "Tu peux te choisir parmi eux. Si l'un meurt, l'autre suit."
+                ),
+                color=0xe91e63,
+            )
+
+        elif role_key == "mamori":
+            valid = list(others_alive) + [member]
+            valid = [m for m in valid if m.id in game.alive]
+            if game.last_mamori_target is not None:
+                valid = [m for m in valid if m.id != game.last_mamori_target]
+            if not valid:
+                return
+            view = SimpleActionView(game, member, role_key, valid, timeout=duration)
+            em = discord.Embed(
+                title="🛡️ Le Mamori veille",
+                description=(
+                    f"Nuit {game.night_number}. Tu protèges un foyer contre les loups.\n\n"
+                    f"⚠️ Tu ne peux pas protéger la même personne deux nuits d'affilée.\n"
+                    f"*(tu peux te protéger toi-même)*"
+                ),
+                color=0x3498db,
+            )
+
+        elif role_key == "shojo":
+            view = ShojoActionView(game, member, timeout=duration)
+            em = discord.Embed(
+                title="👧 La porte entrouverte",
+                description=(
+                    f"Nuit {game.night_number}. Tu peux entrouvrir la porte pour épier la meute.\n\n"
+                    f"⚠️ **35% de chance d'être repérée** — auquel cas tu meurs cette nuit."
+                ),
                 color=0x9b59b6,
             )
-            em.set_footer(text=f"{FOOTER_TEXT} ・ Partie #{game.game_id[-8:]}")
+        else:
+            return
+
+        em.set_footer(text=f"{FOOTER_TEXT} ・ Partie #{game.game_id[-8:]}")
+        try:
             await member.send(embed=em, view=view)
         except discord.Forbidden:
             log.info(f"DM fermé pour {member} ({role_key})")
+            try:
+                await game.channel.send(embed=error_embed(
+                    "⚠️ DM fermé",
+                    f"Un joueur a ses DMs fermés. Action perdue cette nuit."
+                ))
+            except discord.HTTPException:
+                pass
         except discord.HTTPException as e:
             log.warning(f"Échec DM action à {member}: {e}")
 
     @staticmethod
+    async def send_witch_dm(game, witch_member, duration):
+        """Envoie en DM à la sorcière les infos sur la victime des loups + sa vue d'action."""
+        target_id = game.current_wolf_target
+        target_m = game.get_member(target_id) if target_id else None
+
+        if target_m:
+            victim_line = (
+                f"🩸 **Cette nuit, les loups veulent dévorer : {target_m.display_name}**\n\n"
+            )
+        else:
+            victim_line = "*Les loups n'ont désigné personne cette nuit.*\n\n"
+
+        em = discord.Embed(
+            title="🧪 La Majo se réveille",
+            description=(
+                f"Nuit {game.night_number}.\n\n"
+                + victim_line +
+                f"Tes potions :\n"
+                f"🍵 Potion de vie : {'✅ disponible' if not game.majo_heal_used else '❌ utilisée'}\n"
+                f"☠️ Potion de mort : {'✅ disponible' if not game.majo_poison_used else '❌ utilisée'}\n\n"
+                f"⏳ **{duration} secondes** pour choisir."
+            ),
+            color=0x9b59b6,
+        ).set_footer(text=f"{FOOTER_TEXT} ・ Partie #{game.game_id[-8:]}")
+        view = MajoActionView(game, witch_member, timeout=duration)
+        try:
+            await witch_member.send(embed=em, view=view)
+        except discord.Forbidden:
+            log.info(f"DM fermé pour la sorcière {witch_member}")
+        except discord.HTTPException as e:
+            log.warning(f"Échec DM sorcière {witch_member}: {e}")
+
+    @staticmethod
     async def resolve_night(game: Game):
-        """
-        Ordre de résolution :
-        1. Cupidon (lie les amoureux) — déjà appliqué lors du choix
-        2. Voyante → DM résultat
-        3. Petite Fille → check si repérée
-        4. Loups → choix de victime (majorité)
-        5. Salvateur → annule l'attaque si protège la victime
-        6. Sorcière → potion vie (sauve) / potion mort (tue)
-        7. Oyaōkami infect → transforme au lieu de tuer
-        8. Application des morts + Chasseur en chaîne + Amoureux en chaîne
-        """
-        deaths_tonight = set()  # user_ids qui meurent cette nuit
-        infected_tonight = None  # user_id qui devient loup
+        """Résolution finale : combine cible loups, salvateur, infection, sorcière, petite fille."""
+        deaths_tonight = set()
+        infected_tonight = None
 
-        # 1. Cupidon : géré dans EnmusubiActionView au moment du choix
-        #    (set game.lovers est déjà à jour)
-
-        # 2. Voyante (envoi DM)
+        # 1. Miko : envoi de l'indice narratif (70/30)
         for uid, act in game.night_actions.items():
             if act.get("action") == "miko_inspect":
                 target_id = act["target"]
                 target_role = ROLES[game.roles_assignment[target_id]]
-                camp_display = GameManager.camp_display(target_role["camp"])
                 inspector = game.get_member(uid)
                 target_m = game.get_member(target_id)
                 if inspector and target_m:
+                    hint = get_seer_hint(target_role["camp"])
                     try:
                         em = discord.Embed(
                             title="🔮 Vision de la Miko",
-                            description=f"**{target_m.display_name}** appartient au camp : {camp_display}",
+                            description=(
+                                f"Tu sondes **{target_m.display_name}**...\n\n"
+                                f"> {hint}\n\n"
+                                f"*À toi de juger ce que cela signifie.*"
+                            ),
                             color=0x3498db,
                         )
                         em.set_footer(text=FOOTER_TEXT)
@@ -1590,7 +2070,7 @@ class GameManager:
                     except discord.HTTPException:
                         pass
 
-        # 3. Petite Fille
+        # 2. Petite Fille : repérage 35%
         shojo_spotted = False
         shojo_id = None
         for uid, act in game.night_actions.items():
@@ -1599,7 +2079,6 @@ class GameManager:
                 if random.random() < 0.35:
                     shojo_spotted = True
                 else:
-                    # Récupère la "discussion" des loups (la cible votée majoritairement)
                     shojo_member = game.get_member(uid)
                     if shojo_member:
                         wolf_names = [game.get_member(w.id).display_name for w in game.alive_wolves()]
@@ -1617,17 +2096,10 @@ class GameManager:
                         except discord.HTTPException:
                             pass
 
-        # 4. Loups : majorité des votes
-        wolf_target_id = None
-        if game.wolf_votes:
-            tally = {}
-            for wolf_id, tgt in game.wolf_votes.items():
-                tally[tgt] = tally.get(tgt, 0) + 1
-            max_v = max(tally.values())
-            top = [t for t, v in tally.items() if v == max_v]
-            wolf_target_id = random.choice(top)
+        # 3. Cible des loups (déjà calculée dans game.current_wolf_target)
+        wolf_target_id = game.current_wolf_target
 
-        # 5. Salvateur
+        # 4. Salvateur
         protected_id = None
         for uid, act in game.night_actions.items():
             if act.get("action") == "mamori_protect":
@@ -1635,50 +2107,48 @@ class GameManager:
                 game.last_mamori_target = protected_id
                 break
 
-        # 6. Oyaōkami infect (a précédence si activé)
+        # 5. Oyaōkami infect
         oyaokami_infect_target = None
         for uid, act in game.night_actions.items():
             if act.get("action") == "oyaokami_infect" and not game.oyaokami_infect_used:
                 oyaokami_infect_target = act["target"]
-                game.oyaokami_infect_used = True
-                break
 
         if oyaokami_infect_target is not None and oyaokami_infect_target == wolf_target_id:
-            # La victime est infectée au lieu d'être tuée
             infected_tonight = oyaokami_infect_target
-            wolf_target_id = None  # annulé
-        elif wolf_target_id is not None and wolf_target_id == protected_id:
-            # Salvateur a bloqué
+            game.oyaokami_infect_used = True
             wolf_target_id = None
+        elif wolf_target_id is not None and wolf_target_id == protected_id:
+            wolf_target_id = None  # Mamori a bloqué
 
         if wolf_target_id is not None:
             deaths_tonight.add(wolf_target_id)
 
-        # 7. Sorcière
-        majo_heal_target = None
+        # 6. Sorcière : potions (target=-1 pour heal signifie la victime des loups)
+        majo_heal = False
         majo_poison_target = None
         for uid, act in game.night_actions.items():
             if act.get("action") == "majo_heal" and not game.majo_heal_used:
-                majo_heal_target = act["target"]
+                majo_heal = True
                 game.majo_heal_used = True
             elif act.get("action") == "majo_poison" and not game.majo_poison_used:
                 majo_poison_target = act["target"]
                 game.majo_poison_used = True
 
-        if majo_heal_target is not None and majo_heal_target in deaths_tonight:
-            deaths_tonight.discard(majo_heal_target)
+        # Heal annule la mort de la victime des loups
+        if majo_heal and game.current_wolf_target is not None:
+            deaths_tonight.discard(game.current_wolf_target)
         if majo_poison_target is not None:
             deaths_tonight.add(majo_poison_target)
 
-        # 7b. Petite Fille repérée → meurt aussi
+        # 7. Petite Fille repérée → meurt
         if shojo_spotted and shojo_id is not None:
             deaths_tonight.add(shojo_id)
 
-        # 8. Application des morts (avec chaînes : amoureux + chasseur)
+        # 8. Application des morts (chaînes amoureux/chasseur/capitaine)
         await GameManager.apply_deaths(game, deaths_tonight, cause="night")
 
-        # Infection (devient loup)
-        if infected_tonight is not None:
+        # 9. Infection (devient loup, rejoint le salon des loups)
+        if infected_tonight is not None and infected_tonight in game.alive:
             game.roles_assignment[infected_tonight] = "okami"
             infected_member = game.get_member(infected_tonight)
             if infected_member:
@@ -1691,18 +2161,19 @@ class GameManager:
                             "Ton ancien rôle est perdu. Tu rejoins la meute."
                         ),
                         color=0xe74c3c,
-                    )
-                    em.set_footer(text=FOOTER_TEXT)
+                    ).set_footer(text=FOOTER_TEXT)
                     await infected_member.send(embed=em)
                 except discord.HTTPException:
                     pass
+                await add_to_wolf_channel(game, infected_member)
 
-        # Annonce du matin
+        # 10. Annonce du matin
         await GameManager.announce_morning(game)
 
     @staticmethod
     async def apply_deaths(game: Game, death_ids, cause: str):
-        """Applique les morts en chaîne : amoureux + chasseur + capitaine."""
+        """Applique les morts en chaîne : amoureux + chasseur + capitaine.
+        Ajoute le suffixe '(MORT)' au pseudo + mute des morts."""
         to_process = list(death_ids)
         processed = set()
 
@@ -1715,12 +2186,22 @@ class GameManager:
             if not game.add_death(uid, cause):
                 continue
 
+            # Marque MORT (pseudo + mute)
+            member = game.get_member(uid)
+            if member:
+                # Rename si pas déjà fait
+                if uid not in game.original_nicks:
+                    original = await mark_dead_nickname(member)
+                    game.original_nicks[uid] = original
+                # Mute
+                await mute_dead_player(game, member)
+                game.muted_players.add(uid)
+
             # Chaîne amoureux
             if uid in game.lovers:
                 for partner_id in game.lovers:
                     if partner_id != uid and partner_id in game.alive and partner_id not in processed:
                         to_process.append(partner_id)
-                        # On annonce séparément le chagrin d'amour
                         partner = game.get_member(partner_id)
                         if partner:
                             try:
@@ -1732,7 +2213,7 @@ class GameManager:
                             except discord.HTTPException:
                                 pass
 
-            # Chasseur : peut tirer
+            # Chasseur : tir
             if game.role_key(uid) == "karyudo":
                 hunter_target = await GameManager.ask_hunter_target(game, uid)
                 if hunter_target is not None and hunter_target in game.alive:
@@ -1749,7 +2230,7 @@ class GameManager:
                         except discord.HTTPException:
                             pass
 
-            # Capitaine mort → désigne un successeur
+            # Capitaine mort → désigne successeur
             if uid == game.captain_id:
                 new_captain = await GameManager.ask_new_captain(game, uid)
                 if new_captain is not None and new_captain in game.alive:
@@ -1770,63 +2251,56 @@ class GameManager:
 
     @staticmethod
     async def ask_hunter_target(game: Game, hunter_id):
-        """DM au chasseur pour qu'il choisisse sa cible. Timeout 30s."""
         hunter = game.get_member(hunter_id)
         if not hunter:
             return None
         candidates = [m for m in game.alive_players() if m.id != hunter_id]
         if not candidates:
             return None
-
-        view = SimpleActionView(game, hunter, "karyudo_shoot", candidates, timeout=30)
+        dur = get_timing("hunter")
+        view = SimpleActionView(game, hunter, "karyudo_shoot", candidates, timeout=dur)
         try:
             em = discord.Embed(
                 title="🏹 Dernier tir du Karyūdo",
                 description=(
                     "Tu meurs, mais tu peux emporter quelqu'un avec toi.\n"
-                    "⏳ 30 secondes pour choisir. Sans réponse, ton pouvoir est perdu."
+                    f"⏳ {dur} secondes pour choisir. Sans réponse, ton pouvoir est perdu."
                 ),
                 color=0xe67e22,
-            )
-            em.set_footer(text=FOOTER_TEXT)
+            ).set_footer(text=FOOTER_TEXT)
             await hunter.send(embed=em, view=view)
         except discord.HTTPException:
             return None
-
         await view.wait()
         return game.night_actions.get(hunter_id, {}).get("target")
 
     @staticmethod
     async def ask_new_captain(game: Game, dying_captain_id):
-        """DM au capitaine mourant pour choisir son successeur."""
         captain = game.get_member(dying_captain_id)
         if not captain:
             return None
         candidates = [m for m in game.alive_players() if m.id != dying_captain_id]
         if not candidates:
             return None
-
-        view = SimpleActionView(game, captain, "captain_successor", candidates, timeout=30)
+        dur = get_timing("successor")
+        view = SimpleActionView(game, captain, "captain_successor", candidates, timeout=dur)
         try:
             em = discord.Embed(
                 title="👑 Désigne ton successeur",
                 description=(
-                    "Tu es le Sonchō et tu vas mourir. Choisis ton successeur.\n"
-                    "⏳ 30 secondes. Sans réponse, le titre est perdu."
+                    f"Tu es le Sonchō et tu vas mourir. Choisis ton successeur.\n"
+                    f"⏳ {dur} secondes. Sans réponse, le titre est perdu."
                 ),
                 color=0xf1c40f,
-            )
-            em.set_footer(text=FOOTER_TEXT)
+            ).set_footer(text=FOOTER_TEXT)
             await captain.send(embed=em, view=view)
         except discord.HTTPException:
             return None
-
         await view.wait()
         return game.night_actions.get(dying_captain_id, {}).get("target")
 
     @staticmethod
     async def announce_morning(game: Game):
-        """Annonce les morts de la nuit."""
         last_night_deaths = [d for d in game.dead if d["night"] == game.night_number and d["cause"] == "night"]
         if not last_night_deaths:
             em = discord.Embed(
@@ -1840,7 +2314,8 @@ class GameManager:
                 m = game.get_member(d["user_id"])
                 role = ROLES.get(game.roles_assignment.get(d["user_id"]), {})
                 if m:
-                    lines.append(f"💀 **{m.display_name}** — *{role.get('name_fr', '?')}* ({role.get('emoji', '')})")
+                    display = (m.nick or m.name).replace(" (MORT)", "").replace("MORT", "").strip() or m.name
+                    lines.append(f"💀 **{display}** — *{role.get('name_fr', '?')}* ({role.get('emoji', '')})")
             em = discord.Embed(
                 title=f"☀️ Aube du jour {game.night_number}",
                 description="**Cette nuit, le village a perdu :**\n\n" + "\n".join(lines),
@@ -1853,26 +2328,28 @@ class GameManager:
 
     @staticmethod
     async def run_day(game: Game):
-        """Débat + vote du village."""
-        # Débat
-        end_ts = int((datetime.now(PARIS_TZ) + timedelta(seconds=DEBATE_DURATION)).timestamp())
+        """Débat + vote du village (timings dynamiques)."""
+        debate_dur = get_timing("debate")
+        vote_dur = get_timing("vote_day")
+
+        end_ts = int((datetime.now(PARIS_TZ) + timedelta(seconds=debate_dur)).timestamp())
         em = discord.Embed(
             title=f"🗣️ Débat — Jour {game.night_number}",
             description=(
                 f"Le village se rassemble pour discuter et voter.\n\n"
-                f"💬 **{DEBATE_DURATION} secondes** de débat.\n"
+                f"💬 **{debate_dur} secondes** de débat.\n"
                 f"⏰ Vote dans : <t:{end_ts}:R>"
             ),
             color=0xe67e22,
         )
         em.set_footer(text=FOOTER_TEXT)
         await game.channel.send(embed=em)
-        await asyncio.sleep(DEBATE_DURATION // 2)
+        await asyncio.sleep(debate_dur // 2)
         try:
-            await game.channel.send(embed=info_embed("⏳ Plus qu'une minute", "Préparez vos accusations..."))
+            await game.channel.send(embed=info_embed("⏳ Plus que la moitié", "Préparez vos accusations..."))
         except discord.HTTPException:
             pass
-        await asyncio.sleep(DEBATE_DURATION // 2)
+        await asyncio.sleep(debate_dur - (debate_dur // 2))
 
         # Vote
         em = discord.Embed(
@@ -1880,12 +2357,12 @@ class GameManager:
             description=(
                 "Désigne qui doit être éliminé. Le vote est **anonyme**.\n"
                 "👑 Le Sonchō compte pour **2 voix**.\n\n"
-                f"⏳ **{VOTE_DURATION} secondes**."
+                f"⏳ **{vote_dur} secondes**."
             ),
             color=0xe91e63,
         )
         em.set_footer(text=FOOTER_TEXT)
-        view = DayVoteView(game, timeout=VOTE_DURATION)
+        view = DayVoteView(game, timeout=vote_dur)
         msg = await game.channel.send(embed=em, view=view)
         view.message = msg
         await view.wait()
@@ -2132,7 +2609,9 @@ class GameManager:
 # ========================= VIEWS =========================
 
 class RecruitingView(discord.ui.View):
-    def __init__(self, game: Game, timeout=RECRUIT_TIMEOUT):
+    def __init__(self, game: Game, timeout=None):
+        if timeout is None:
+            timeout = get_timing("recruit")
         super().__init__(timeout=timeout)
         self.game = game
         self.message = None
@@ -2222,7 +2701,9 @@ class RecruitingView(discord.ui.View):
 
 class SimpleActionView(discord.ui.View):
     """Sélecteur générique : pick 1 cible parmi candidates, stocké dans game.night_actions[actor.id]."""
-    def __init__(self, game: Game, actor: discord.Member, action_key: str, candidates, timeout=NIGHT_DURATION):
+    def __init__(self, game: Game, actor: discord.Member, action_key: str, candidates, timeout=None):
+        if timeout is None:
+            timeout = get_timing("night")
         super().__init__(timeout=timeout)
         self.game = game
         self.actor = actor
@@ -2261,72 +2742,129 @@ class SimpleActionSelect(discord.ui.Select):
         v.stop()
 
 
-class WolfActionView(discord.ui.View):
-    """Vue spécifique aux loups : choisir victime + optionnellement infecter (Oyaōkami)."""
-    def __init__(self, game: Game, actor: discord.Member, role_key: str, candidates, timeout=NIGHT_DURATION):
+class WolfVoteView(discord.ui.View):
+    """Vue partagée dans le salon des loups : tous les loups votent ensemble en temps réel.
+    Met à jour l'embed pour afficher les votes au fur et à mesure.
+    L'Oyaōkami a un bouton supplémentaire pour basculer en mode infection."""
+    def __init__(self, game: Game, candidates, timeout):
         super().__init__(timeout=timeout)
         self.game = game
-        self.actor = actor
-        self.role_key = role_key
+        self.candidates = candidates
+        self.message = None
+        self.infect_mode = False  # global pour l'Oyaōkami
         options = [
             discord.SelectOption(label=m.display_name[:80], value=str(m.id))
             for m in candidates[:25]
         ]
-        self.add_item(WolfTargetSelect(self, options))
-        if role_key == "oyaokami" and not game.oyaokami_infect_used:
-            self.add_item(WolfInfectToggle(self))
-        self.infect_mode = False  # toggle
+        self.add_item(_WolfVoteSelect(self, options))
 
-    def refresh_label(self):
-        for child in self.children:
-            if isinstance(child, WolfInfectToggle):
-                child.label = ("🩸 Infecter : ON" if self.infect_mode else "🩸 Infecter : OFF")
-                child.style = discord.ButtonStyle.danger if self.infect_mode else discord.ButtonStyle.secondary
+        # Bouton infect pour l'Oyaōkami si pas encore utilisé
+        if any(game.roles_assignment.get(w.id) == "oyaokami" for w in game.alive_wolves()) and not game.oyaokami_infect_used:
+            self.add_item(_WolfInfectToggle(self))
 
+    async def update_message(self):
+        """Met à jour le message avec l'état actuel des votes."""
+        if not self.message:
+            return
+        tally = {}
+        for tgt in self.game.wolf_votes.values():
+            tally[tgt] = tally.get(tgt, 0) + 1
 
-class WolfTargetSelect(discord.ui.Select):
-    def __init__(self, parent_view: WolfActionView, options):
-        super().__init__(placeholder="Choisis la victime de la meute...", min_values=1, max_values=1, options=options)
-        self.parent_view = parent_view
+        if tally:
+            sorted_tally = sorted(tally.items(), key=lambda x: -x[1])
+            lines = []
+            for tgt_id, count in sorted_tally:
+                m = self.game.get_member(tgt_id)
+                if m:
+                    lines.append(f"• **{m.display_name}** — {count} voix")
+            tally_text = "\n".join(lines)
+        else:
+            tally_text = "*Aucun vote pour l'instant.*"
 
-    async def callback(self, interaction: discord.Interaction):
-        v = self.parent_view
-        if interaction.user.id != v.actor.id:
-            return await interaction.response.send_message("Ce n'est pas ton action.", ephemeral=True)
-        target_id = int(self.values[0])
-        v.game.wolf_votes[v.actor.id] = target_id
-        # Si Oyaōkami avec infect_mode, on enregistre l'infection
-        if v.role_key == "oyaokami" and v.infect_mode and not v.game.oyaokami_infect_used:
-            v.game.night_actions[v.actor.id] = {"action": "oyaokami_infect", "target": target_id}
-        target_m = v.game.get_member(target_id)
-        target_name = target_m.display_name if target_m else "?"
-        action_txt = "infecter" if (v.role_key == "oyaokami" and v.infect_mode) else "tuer"
-        for item in v.children:
+        em = discord.Embed(
+            title=f"🐺 Vote de la meute — Nuit {self.game.night_number}",
+            description=(
+                "Choisissez votre victime. **La majorité l'emporte.**\n\n"
+                f"**Votes actuels :**\n{tally_text}\n\n"
+                f"*Loups :* {', '.join(w.mention for w in self.game.alive_wolves())}"
+                + (f"\n\n🩸 **Mode infection : ON** (l'Oyaōkami transformera la cible au lieu de tuer)"
+                   if self.infect_mode else "")
+            ),
+            color=0xe74c3c,
+        ).set_footer(text=FOOTER_TEXT)
+        try:
+            await self.message.edit(embed=em, view=self)
+        except discord.HTTPException:
+            pass
+
+    async def on_timeout(self):
+        for item in self.children:
             item.disabled = True
-        await interaction.response.edit_message(
-            content=f"🐺 Vote enregistré : **{action_txt} {target_name}**\n*La cible finale sera celle votée par la majorité des loups.*",
-            view=v
-        )
-        v.stop()
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
 
-class WolfInfectToggle(discord.ui.Button):
-    def __init__(self, parent_view: WolfActionView):
-        super().__init__(label="🩸 Infecter : OFF", style=discord.ButtonStyle.secondary)
+class _WolfVoteSelect(discord.ui.Select):
+    def __init__(self, parent_view: WolfVoteView, options):
+        super().__init__(placeholder="Vote pour la victime...", min_values=1, max_values=1, options=options)
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction):
         v = self.parent_view
-        if interaction.user.id != v.actor.id:
-            return await interaction.response.send_message("Ce n'est pas ton action.", ephemeral=True)
+        if not v.game.is_wolf(interaction.user.id):
+            return await interaction.response.send_message("Seuls les loups peuvent voter.", ephemeral=True)
+        if interaction.user.id not in v.game.alive:
+            return await interaction.response.send_message("Tu es mort, tu ne peux plus voter.", ephemeral=True)
+        target_id = int(self.values[0])
+        v.game.wolf_votes[interaction.user.id] = target_id
+        # Si l'Oyaōkami a activé le mode infect et c'est lui qui vote, on enregistre l'intention
+        if v.infect_mode and v.game.roles_assignment.get(interaction.user.id) == "oyaokami" and not v.game.oyaokami_infect_used:
+            v.game.night_actions[interaction.user.id] = {"action": "oyaokami_infect", "target": target_id}
+        target_m = v.game.get_member(target_id)
+        await interaction.response.send_message(
+            f"✅ Vote enregistré : **{target_m.display_name if target_m else '?'}**",
+            ephemeral=True,
+        )
+        await v.update_message()
+
+
+class _WolfInfectToggle(discord.ui.Button):
+    def __init__(self, parent_view: WolfVoteView):
+        super().__init__(label="🩸 Mode infection : OFF", style=discord.ButtonStyle.secondary)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction):
+        v = self.parent_view
+        if v.game.roles_assignment.get(interaction.user.id) != "oyaokami":
+            return await interaction.response.send_message(
+                "Seul l'Oyaōkami peut activer ce mode.", ephemeral=True
+            )
+        if v.game.oyaokami_infect_used:
+            return await interaction.response.send_message(
+                "Tu as déjà utilisé ton infection.", ephemeral=True
+            )
         v.infect_mode = not v.infect_mode
-        v.refresh_label()
-        await interaction.response.edit_message(view=v)
+        self.label = "🩸 Mode infection : ON" if v.infect_mode else "🩸 Mode infection : OFF"
+        self.style = discord.ButtonStyle.danger if v.infect_mode else discord.ButtonStyle.secondary
+        # Si on désactive et qu'il y avait une intention, on l'enlève
+        if not v.infect_mode and interaction.user.id in v.game.night_actions:
+            if v.game.night_actions[interaction.user.id].get("action") == "oyaokami_infect":
+                v.game.night_actions.pop(interaction.user.id, None)
+        await interaction.response.send_message(
+            f"🩸 Mode infection {'**activé**' if v.infect_mode else '**désactivé**'}.",
+            ephemeral=True,
+        )
+        await v.update_message()
 
 
 class MajoActionView(discord.ui.View):
     """Sorcière : 3 choix : utiliser potion vie, potion mort, ou rien."""
-    def __init__(self, game: Game, actor: discord.Member, timeout=NIGHT_DURATION):
+    def __init__(self, game: Game, actor: discord.Member, timeout=None):
+        if timeout is None:
+            timeout = get_timing("witch")
         super().__init__(timeout=timeout)
         self.game = game
         self.actor = actor
@@ -2400,7 +2938,9 @@ class MajoPassButton(discord.ui.Button):
 
 
 class MajoPoisonTargetView(discord.ui.View):
-    def __init__(self, game: Game, actor: discord.Member, candidates, timeout=NIGHT_DURATION):
+    def __init__(self, game: Game, actor: discord.Member, candidates, timeout=None):
+        if timeout is None:
+            timeout = get_timing("witch")
         super().__init__(timeout=timeout)
         self.game = game
         self.actor = actor
@@ -2435,7 +2975,9 @@ class MajoPoisonSelect(discord.ui.Select):
 
 class EnmusubiActionView(discord.ui.View):
     """Cupidon : choisit 2 amoureux."""
-    def __init__(self, game: Game, actor: discord.Member, candidates, timeout=NIGHT_DURATION):
+    def __init__(self, game: Game, actor: discord.Member, candidates, timeout=None):
+        if timeout is None:
+            timeout = get_timing("night")
         super().__init__(timeout=timeout)
         self.game = game
         self.actor = actor
@@ -2494,7 +3036,9 @@ class EnmusubiSelect(discord.ui.Select):
 
 class ShojoActionView(discord.ui.View):
     """Petite Fille : 2 boutons : espionner ou passer."""
-    def __init__(self, game: Game, actor: discord.Member, timeout=NIGHT_DURATION):
+    def __init__(self, game: Game, actor: discord.Member, timeout=None):
+        if timeout is None:
+            timeout = get_timing("night")
         super().__init__(timeout=timeout)
         self.game = game
         self.actor = actor
@@ -2529,7 +3073,9 @@ class ShojoActionView(discord.ui.View):
 
 class CaptainVoteView(discord.ui.View):
     """Vote pour élire le Capitaine au jour 1."""
-    def __init__(self, game: Game, timeout=CAPTAIN_VOTE_DURATION):
+    def __init__(self, game: Game, timeout=None):
+        if timeout is None:
+            timeout = get_timing("captain_vote")
         super().__init__(timeout=timeout)
         self.game = game
         self.votes = {}  # voter_id → target_id
@@ -2572,7 +3118,9 @@ class CaptainVoteSelect(discord.ui.Select):
 
 class DayVoteView(discord.ui.View):
     """Vote du jour pour éliminer un joueur."""
-    def __init__(self, game: Game, timeout=VOTE_DURATION):
+    def __init__(self, game: Game, timeout=None):
+        if timeout is None:
+            timeout = get_timing("vote_day")
         super().__init__(timeout=timeout)
         self.game = game
         self.votes = {}
@@ -3190,6 +3738,80 @@ async def _setlog(ctx, channel: discord.TextChannel = None):
     await ctx.send(embed=success_embed("✅ Logs configurés", f"Logs dans {channel.mention}."))
 
 
+TIMING_LABELS = {
+    "recruit":      "Recrutement (inscriptions)",
+    "night":        "Phase de nuit (acteurs + loups)",
+    "witch":        "Phase Sorcière (après loups)",
+    "debate":       "Débat du jour",
+    "vote_day":     "Vote du jour",
+    "captain_vote": "Élection du Capitaine",
+    "hunter":       "Tir du Chasseur",
+    "successor":    "Choix du successeur (Sonchō)",
+}
+
+
+@bot.command(name="settime", aliases=["timings", "settiming"])
+async def _settime(ctx, phase: str = None, seconds: int = None):
+    """Sys+ : modifie les durées des phases. `!settime` seul = liste."""
+    if not has_min_rank(ctx.author.id, 3):
+        return await ctx.send(embed=error_embed("❌ Permission refusée", "**Sys+** requis."))
+
+    # Sans argument : liste actuelle
+    if phase is None:
+        lines = []
+        for key, label in TIMING_LABELS.items():
+            cur = get_timing(key)
+            default = DEFAULT_TIMINGS[key]
+            marker = "" if cur == default else "  *(modifié)*"
+            lines.append(f"`{key:<13}` **{cur}s**  — *{label}*{marker}")
+        em = info_embed(
+            "⏱️ Durées des phases",
+            "\n".join(lines) +
+            f"\n\n*Usage :* `{get_prefix_cached()}settime <phase> <secondes>`\n"
+            f"*Reset :* `{get_prefix_cached()}settime <phase> reset`"
+        )
+        await ctx.send(embed=em)
+        return
+
+    phase = phase.lower().strip()
+    if phase not in DEFAULT_TIMINGS:
+        valid = ", ".join(f"`{k}`" for k in DEFAULT_TIMINGS)
+        return await ctx.send(embed=error_embed(
+            "❌ Phase inconnue",
+            f"Phases valides : {valid}"
+        ))
+
+    # Reset : !settime <phase> reset (passé via le second arg textuel)
+    # Comme seconds est typé int, on passe par ctx.message
+    raw = ctx.message.content.split(maxsplit=3)
+    if len(raw) >= 3 and raw[2].lower() == "reset":
+        reset_timing(phase)
+        return await ctx.send(embed=success_embed(
+            "✅ Timing réinitialisé",
+            f"`{phase}` est revenu à **{DEFAULT_TIMINGS[phase]}s** (défaut)."
+        ))
+
+    if seconds is None:
+        return await ctx.send(embed=error_embed(
+            "Argument manquant",
+            f"Usage : `{get_prefix_cached()}settime {phase} <secondes>`\n"
+            f"Actuel : **{get_timing(phase)}s** ・ Défaut : **{DEFAULT_TIMINGS[phase]}s**"
+        ))
+
+    if seconds < 5 or seconds > 3600:
+        return await ctx.send(embed=error_embed(
+            "❌ Valeur invalide",
+            "La durée doit être entre **5** et **3600** secondes (1 heure)."
+        ))
+
+    set_timing(phase, seconds)
+    label = TIMING_LABELS.get(phase, phase)
+    await ctx.send(embed=success_embed(
+        "✅ Timing modifié",
+        f"**{label}** : maintenant **{seconds}s** *(défaut {DEFAULT_TIMINGS[phase]}s)*"
+    ))
+
+
 @bot.command(name="resetstats")
 async def _resetstats(ctx, *, user_input: str = None):
     if not has_min_rank(ctx.author.id, 3):
@@ -3293,11 +3915,14 @@ HELP_CATEGORIES = {
     "system": {
         "emoji": "⚙️", "label": "Système", "title": "⚙️  Système",
         "items": [
-            ("allow #salon",   "Autoriser un salon", 3),
-            ("unallow #salon", "Retirer un salon autorisé", 3),
-            ("allow",          "Lister les salons autorisés", 3),
-            ("setlog #salon",  "Salon de logs", 4),
-            ("prefix [new]",   "Changer le prefix", 4),
+            ("allow #salon",            "Autoriser un salon", 3),
+            ("unallow #salon",          "Retirer un salon autorisé", 3),
+            ("allow",                   "Lister les salons autorisés", 3),
+            ("settime",                 "Voir toutes les durées de phases", 3),
+            ("settime <phase> <sec>",   "Modifier la durée d'une phase", 3),
+            ("settime <phase> reset",   "Remettre la durée par défaut", 3),
+            ("setlog #salon",           "Salon de logs", 4),
+            ("prefix [new]",            "Changer le prefix", 4),
         ],
     },
     "hierarchy": {
